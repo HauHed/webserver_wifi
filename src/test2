@@ -1,0 +1,160 @@
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+
+// ===== I2C CONFIG =====
+#define I2C_MASTER_NUM I2C_NUM_0
+#define I2C_MASTER_SDA_IO 21
+#define I2C_MASTER_SCL_IO 22
+#define I2C_MASTER_FREQ_HZ 100000
+#define DS3231_ADDR 0x68
+
+static const char *TAG = "DS3231_WEB";
+
+// ===== WIFI CONFIG =====
+#define WIFI_SSID "DS3231_Setup"
+#define WIFI_PASS "12345678"
+
+// ===== I2C FUNCTIONS =====
+esp_err_t ds3231_write(uint8_t reg, uint8_t data) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (DS3231_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_write_byte(cmd, data, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+uint8_t dec_to_bcd(uint8_t val) {
+    return ((val / 10) << 4) | (val % 10);
+}
+
+void i2c_master_init() {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ
+    };
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+}
+
+// ===== WIFI AP =====
+void wifi_init_ap(void) {
+    esp_wifi_disconnect();
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .password = WIFI_PASS,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK
+        },
+    };
+    if (strlen(WIFI_PASS) == 0) {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    esp_wifi_start();
+
+    ESP_LOGI(TAG, "AP Started. SSID:%s Password:%s", WIFI_SSID, WIFI_PASS);
+}
+
+// ===== WEB SERVER HANDLERS =====
+const char* html_page = "<!DOCTYPE html>"
+"<html>"
+"<head><title>DS3231 Set Time</title></head>"
+"<body>"
+"<h2>ตั้งเวลา DS3231</h2>"
+"<form action=\"/set_time\" method=\"POST\">"
+"Hour: <input type=\"number\" name=\"hh\" min=\"0\" max=\"23\"><br>"
+"Minute: <input type=\"number\" name=\"mm\" min=\"0\" max=\"59\"><br>"
+"Second: <input type=\"number\" name=\"ss\" min=\"0\" max=\"59\"><br>"
+"<input type=\"submit\" value=\"Set Time\">"
+"</form>"
+"</body>"
+"</html>";
+
+esp_err_t index_get_handler(httpd_req_t *req) {
+    httpd_resp_send(req, html_page, strlen(html_page));
+    return ESP_OK;
+}
+
+esp_err_t set_time_handler(httpd_req_t *req) {
+    char buf[100];
+    int ret = httpd_req_recv(req, buf, req->content_len);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    int hh, mm, ss;
+    sscanf(buf, "hh=%d&mm=%d&ss=%d", &hh, &mm, &ss);
+
+    ds3231_write(0x00, dec_to_bcd(ss));
+    ds3231_write(0x01, dec_to_bcd(mm));
+    ds3231_write(0x02, dec_to_bcd(hh));
+
+    httpd_resp_sendstr(req, "Time Set Successfully!");
+    return ESP_OK;
+}
+
+// ===== START SERVER =====
+void start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+    config.stack_size = 8192;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t index_uri = {
+            .uri = "/uri",
+            .method = HTTP_GET,
+            .handler = index_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &index_uri);
+
+        httpd_uri_t set_time_uri = {
+            .uri = "/set_time",
+            .method = HTTP_POST,
+            .handler = set_time_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &set_time_uri);
+
+        ESP_LOGI(TAG, "Web server started");
+    }
+}
+
+// ===== MAIN =====
+void app_main(void) {
+    nvs_flash_init();
+    wifi_init_ap();        // เริ่ม Wi-Fi AP
+    i2c_master_init();     // เริ่ม I2C
+    start_webserver();     // เริ่ม Web Server
+}
