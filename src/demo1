@@ -1,0 +1,462 @@
+#include <stdio.h>
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2c_master.h"
+#include "esp_now.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include <string.h>
+#include "esp_sleep.h"
+#include "freertos/event_groups.h"
+#include <stdlib.h>
+#include <ctype.h>
+#include "esp_err.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "esp_spiffs.h"
+#include <driver/gpio.h> 
+#include "cJSON.h"
+
+#define SEND_SUCCESS_BIT BIT0
+#define I2C_MASTER_PORT 0
+#define I2C_MASTER_SDA_IO 6
+#define I2C_MASTER_SCL_IO 7
+#define I2C_MASTER_FREQ_HZ 100000
+#define HTU21D_ADDR 0x40
+#define DS3231_ADDR 0x68
+#define CMD_TEMP 0xE3
+#define CMD_HUM 0xE5
+#define DELAY_MINUTE_MS 5000
+#define BUTTON_GPIO 21
+#define BUTTON_HOLD_MS 5000
+
+volatile bool send_done_success = false;
+static const char *TAG = "DS3231_WEB";
+static esp_err_t save_post_handler(httpd_req_t *req);
+
+#define WIFI_SSID "DS3231_Setup"
+#define WIFI_PASS "12345678"
+
+
+EventGroupHandle_t send_event_group;
+
+i2c_master_bus_handle_t bus;
+i2c_master_dev_handle_t htu_dev;
+i2c_master_dev_handle_t ds3231_dev;
+
+uint8_t receiver_mac[] = {0x30, 0xC6, 0xF7, 0xF4, 0x65, 0x00}; // เลขMACตัวรับ
+
+uint8_t bcd_to_dec(uint8_t val)
+{
+    return ((val >> 4) * 10) + (val & 0x0F);
+}
+
+uint8_t dec_to_bcd(uint8_t val)
+{
+    return ((val / 10) << 4) | (val % 10);
+}
+
+void ds3231_set_time(i2c_master_dev_handle_t dev,
+                     uint8_t hour, uint8_t min, uint8_t sec,
+                     uint8_t day, uint8_t month, uint8_t year)
+{
+    uint8_t data[8];
+    data[0] = 0x00;
+    data[1] = dec_to_bcd(sec);
+    data[2] = dec_to_bcd(min);
+    data[3] = dec_to_bcd(hour);
+    data[4] = 1;
+    data[5] = dec_to_bcd(day);
+    data[6] = dec_to_bcd(month);
+    data[7] = dec_to_bcd(year);
+
+    ESP_ERROR_CHECK(i2c_master_transmit(dev, data, 8, 1000));
+}
+
+void wifi_init_ap(void) {
+    esp_wifi_disconnect();
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .password = WIFI_PASS,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK
+        },
+    };
+    if (strlen(WIFI_PASS) == 0) {
+        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    esp_wifi_start();
+
+    ESP_LOGI(TAG, "AP Started. SSID:%s Password:%s", WIFI_SSID, WIFI_PASS);
+}
+void spiffs_init(void)
+{
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = NULL,
+        .max_files = 5,
+        .format_if_mount_failed = true
+    };
+    ESP_ERROR_CHECK(esp_vfs_spiffs_register(&conf));
+    size_t total = 0, used = 0;
+    ESP_ERROR_CHECK(esp_spiffs_info(NULL, &total, &used));
+    ESP_LOGI(TAG, "SPIFFS mounted. Total: %d, Used: %d", total, used);
+}
+
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    FILE *f = fopen("/spiffs/index.html", "r");
+    if (!f) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    fseek(f, 0, SEEK_END);
+    size_t len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *buf = malloc(len + 1);
+    if (!buf) {
+        fclose(f);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    fread(buf, 1, len, f);
+    buf[len] = '\0';
+    fclose(f);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr(req, buf);
+    free(buf);
+
+    return ESP_OK;
+}
+
+void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
+{ // เช็คว่าข้อมูลส่งได้หรือไม่ได้
+    if (status == ESP_NOW_SEND_SUCCESS)
+    {
+        ESP_LOGI("ESP-NOW", "Send success");
+        xEventGroupSetBits(send_event_group, SEND_SUCCESS_BIT);
+    }
+    else
+    {
+        ESP_LOGI("ESP-NOW", "Failled");
+    }
+}
+
+void espnow_init_sender()
+{
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_ERROR_CHECK(esp_now_init());
+
+    esp_now_peer_info_t peer = {
+        .channel = 0,
+        .ifidx = ESP_IF_WIFI_STA,
+        .encrypt = false};
+    memcpy(peer.peer_addr, receiver_mac, 6);
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+    ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
+}
+static esp_err_t set_time_post_handler(httpd_req_t *req)
+{
+    char buf[100];
+    int ret = httpd_req_recv(req, buf, req->content_len);
+    buf[ret] = '\0';
+
+    int hour, min, sec, day, month, year;
+    sscanf(buf, "hour=%d&min=%d&sec=%d&day=%d&month=%d&year=%d",
+           &hour, &min, &sec, &day, &month, &year);
+
+    ds3231_set_time(ds3231_dev, hour, min, sec, day, month, year);
+
+    httpd_resp_sendstr(req, "Time set successfully!");
+    return ESP_OK;
+}
+void start_webserver()
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t root_uri = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = root_get_handler
+        };
+        httpd_register_uri_handler(server, &root_uri);
+
+        httpd_uri_t set_time_uri = {
+            .uri = "/set_time",
+            .method = HTTP_POST,
+            .handler = set_time_post_handler
+        };
+        httpd_register_uri_handler(server, &set_time_uri);
+        httpd_uri_t save_uri = {
+    .uri = "/save",
+    .method = HTTP_POST,
+    .handler = save_post_handler
+};
+httpd_register_uri_handler(server, &save_uri);
+    }
+}
+
+static esp_err_t save_post_handler(httpd_req_t *req) {
+    char buf[200];
+    int ret = httpd_req_recv(req, buf, req->content_len);
+    if (ret <= 0) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    // แปลง JSON
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    int day = cJSON_GetObjectItem(root,"day")->valueint;
+    int month = cJSON_GetObjectItem(root,"month")->valueint;
+    int year = cJSON_GetObjectItem(root,"year")->valueint;
+    int hour = cJSON_GetObjectItem(root,"hour")->valueint;
+    int minute = cJSON_GetObjectItem(root,"minute")->valueint;
+    const char *mac = cJSON_GetObjectItem(root,"mac")->valuestring;
+
+    // เซ็ตเวลา DS3231
+    ds3231_set_time(ds3231_dev, hour, minute, 0, day, month, year);
+
+    // แปลง MAC เป็น array ถ้าจะใช้ ESP-NOW
+    uint8_t mac_addr[6];
+    sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+           &mac_addr[0], &mac_addr[1], &mac_addr[2],
+           &mac_addr[3], &mac_addr[4], &mac_addr[5]);
+    memcpy(receiver_mac, mac_addr, 6);
+    ESP_LOGI(TAG, "MAC set: %s", mac);
+
+    cJSON_Delete(root);
+    httpd_resp_sendstr(req, "Saved successfully!");
+    return ESP_OK;
+}
+
+void i2c_init()
+{
+    i2c_master_bus_config_t bus_config = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_MASTER_PORT,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus));
+
+    i2c_device_config_t htu_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = HTU21D_ADDR, // HTU21
+        .scl_speed_hz = I2C_MASTER_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &htu_cfg, &htu_dev));
+
+    i2c_device_config_t ds_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = DS3231_ADDR, // ds3231
+        .scl_speed_hz = I2C_MASTER_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &ds_cfg, &ds3231_dev));
+}
+
+
+void read_ds3231(uint8_t *hour, uint8_t *min, uint8_t *sec, // อ่านค่าds3231
+                 uint8_t *day, uint8_t *month, uint8_t *year)
+{
+    uint8_t reg = 0x00;
+    uint8_t data[7];
+    ESP_ERROR_CHECK(i2c_master_transmit_receive(ds3231_dev, &reg, 1, data, 7, 1000));
+
+    *hour = bcd_to_dec(data[2]);
+    *min = bcd_to_dec(data[1]);
+    *sec = bcd_to_dec(data[0]);
+    *day = bcd_to_dec(data[4]);
+    *month = bcd_to_dec(data[5] & 0x1F);
+    *year = bcd_to_dec(data[6]);
+}
+
+bool read_temp(float *temp_out)
+{ // อ่านและเช็คค่าอุณหภูมิ
+    uint8_t cmd = CMD_TEMP;
+    uint8_t data[3];
+
+    if (i2c_master_transmit(htu_dev, &cmd, 1, 1000) != ESP_OK)
+    {
+        return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    if (i2c_master_receive(htu_dev, data, 3, 1000) != ESP_OK)
+    {
+        return false;
+    }
+
+    uint16_t raw = ((uint16_t)data[0] << 8) | data[1];
+    raw &= 0xFFFC;
+    float temp = -46.85 + 175.72 * (float)raw / 65536.0;
+
+    if (temp > -50 && temp < 100)
+    {
+        *temp_out = temp;
+        return true;
+    }
+
+    return false;
+}
+bool read_ds3231_check(uint8_t *hour, uint8_t *min, uint8_t *sec, // เช็คเวลาds3231
+                       uint8_t *day, uint8_t *month, uint8_t *year)
+{
+    uint8_t reg = 0x00;
+    uint8_t data[7];
+
+    if (i2c_master_transmit_receive(ds3231_dev, &reg, 1, data, 7, 1000) != ESP_OK)
+    {
+        return false;
+    }
+
+    *hour = bcd_to_dec(data[2]);
+    *min = bcd_to_dec(data[1]);
+    *sec = bcd_to_dec(data[0]);
+    *day = bcd_to_dec(data[4]);
+    *month = bcd_to_dec(data[5] & 0x1F);
+    *year = bcd_to_dec(data[6]);
+
+    if (*year == 0 || *month == 0 || *day == 0)
+    { // วันเดือนปีจะไม่เท่ากับ0
+        return false;
+    }
+    if (*year == 0 && *month == 1 && *day == 1)
+    { // ค่าเป็น 01 01 2000 ไม่ได้เนื่องจากเป็นค่าเริ่มต้นที่ยังไม่ได้ตั้ง
+        return false;
+    }
+
+    return true;
+}
+
+volatile bool web_mode = false;
+void button_task(void *arg) {
+    int last_state = 0;  // เก็บสถานะปุ่มรอบก่อน
+
+    while (1) {
+        int state = gpio_get_level(BUTTON_GPIO);
+
+        if (state == 1 && last_state == 0) {
+            // ตรวจจับ rising edge (จาก 0 → 1) = กดครั้งเดียว
+            vTaskDelay(pdMS_TO_TICKS(50)); // debounce เล็กน้อย
+            if (gpio_get_level(BUTTON_GPIO) == 1) {
+                ESP_LOGI(TAG, "Button pressed once, start AP + Web Server");
+                web_mode = true;
+                wifi_init_ap();
+                spiffs_init();
+                start_webserver();
+
+                // ค้าง task นี้รอเว็บ (หรือจะ break ก็ได้)
+                while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+
+        last_state = state;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+void temp_1(void *arg)
+{
+    while (1)
+    {
+        if(web_mode) { // ถ้า Web Server รัน ให้หยุดส่ง
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        float temp;
+        bool Temp_ok = read_temp(&temp);
+
+        uint8_t hour, min, sec, day, month, year;
+        bool Time_ok = read_ds3231_check(&hour, &min, &sec, &day, &month, &year);
+
+   
+        if (Temp_ok && Time_ok)
+        { // ค่าเวลาและอุณหภูมิต้องไม่มีปัญหา
+            char msg[100];
+            snprintf(msg, sizeof(msg),
+                     "Temp:%.2f  Date:%02d/%02d/20%02d Time:%02d:%02d:%02d",
+                     temp, day, month, year, hour, min, sec);
+            printf("sending: %s\n", msg);
+
+            esp_now_send(receiver_mac, (uint8_t *)msg, strlen(msg) + 1);
+            EventBits_t bits = xEventGroupWaitBits(send_event_group, SEND_SUCCESS_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
+
+            if (bits & SEND_SUCCESS_BIT)
+            {
+                ESP_LOGI("SLEEP", "Send confirmed. Sleeping 1 minute");
+                esp_wifi_stop();
+                esp_deep_sleep(60 * 1000000); // "Key" : "value",
+            }
+            else
+            {
+                ESP_LOGI("SLEEP", "Send Faill");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Sensor read fail, retry in 1s");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(DELAY_MINUTE_MS));
+    }
+}
+
+void app_main()
+{
+  i2c_init();
+    espnow_init_sender();
+    send_event_group = xEventGroupCreate();
+
+    // 2. ตั้ง GPIO ปุ่ม
+   gpio_reset_pin(BUTTON_GPIO);
+gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+// ถ้าคุณมีตัวต้าน 10k ลง GND ภายนอก ให้ใช้ PULLDOWN หรือปิด internal pull
+gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLDOWN_ONLY);
+
+    // 3. สร้าง Task ตรวจปุ่มตลอดเวลา
+    xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
+
+    // 4. เริ่ม Task ปกติ
+    xTaskCreate(temp_1, "temp_1", 8192, NULL, 5, NULL);
+}
+
