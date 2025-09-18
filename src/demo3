@@ -268,48 +268,63 @@ void espnow_init_sender()
 }
 static esp_err_t save_post_handler(httpd_req_t *req)
 {
-    char buf[200];
-    int ret = httpd_req_recv(req, buf, req->content_len);
-    if (ret <= 0)
-    {
+    char buf[512];
+    int ret = httpd_req_recv(req, buf, sizeof(buf)-1);
+    if (ret <= 0) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
     buf[ret] = '\0';
 
     cJSON *root = cJSON_Parse(buf);
-    if (!root)
-    {
+    if (!root) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
-    int day = cJSON_GetObjectItem(root, "day")->valueint;
-    int month = cJSON_GetObjectItem(root, "month")->valueint;
-    int year = cJSON_GetObjectItem(root, "year")->valueint;
-    int hour = cJSON_GetObjectItem(root, "hour")->valueint;
-    int minute = cJSON_GetObjectItem(root, "minute")->valueint;
-    const char *mac = cJSON_GetObjectItem(root, "mac")->valuestring;
+    // ---- ตั้งเวลา (เช็คว่ามี key ครบ) ----
+    cJSON *jday = cJSON_GetObjectItem(root, "day");
+    cJSON *jmonth = cJSON_GetObjectItem(root, "month");
+    cJSON *jyear = cJSON_GetObjectItem(root, "year");
+    cJSON *jhour = cJSON_GetObjectItem(root, "hour");
+    cJSON *jminute = cJSON_GetObjectItem(root, "minute");
 
-    // เซ็ตเวลา DS3231
-    ds3231_set_time(ds3231_dev, hour, minute, 0, day, month, year);
+    if (jday && jmonth && jyear && jhour && jminute) {
+        ds3231_set_time(ds3231_dev,
+                        jhour->valueint,
+                        jminute->valueint,
+                        0,
+                        jday->valueint,
+                        jmonth->valueint,
+                        jyear->valueint);
+        ESP_LOGI(TAG, "Time updated");
+    }
 
-    // แปลง MAC เป็น array
-    uint8_t new_mac[6];
-    sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-           &new_mac[0], &new_mac[1], &new_mac[2],
-           &new_mac[3], &new_mac[4], &new_mac[5]);
+    // ---- ตั้ง MAC (ถ้ามี) ----
+    cJSON *jmac = cJSON_GetObjectItem(root, "mac");
+    if (jmac && jmac->valuestring) {
+        uint8_t new_mac[6];
+        sscanf(jmac->valuestring, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &new_mac[0], &new_mac[1], &new_mac[2],
+               &new_mac[3], &new_mac[4], &new_mac[5]);
+        ESP_LOGI(TAG, "ESP-NOW updated: %02X:%02X:%02X:%02X:%02X:%02X",
+                 new_mac[0], new_mac[1], new_mac[2],
+                 new_mac[3], new_mac[4], new_mac[5]);
+        save_mac_nvs(new_mac);
+    }
 
-    ESP_LOGI(TAG, "ESP-NOW updated: %02X:%02X:%02X:%02X:%02X:%02X",
-             new_mac[0], new_mac[1], new_mac[2],
-             new_mac[3], new_mac[4], new_mac[5]);
-    save_mac_nvs(new_mac);      
+    // ---- Flag ว่าตั้งค่าครั้งแรกเสร็จแล้ว ----
     save_nvs_flag();
+
     cJSON_Delete(root);
+
+    // ตอบกลับก่อนรีสตาร์ท
     httpd_resp_sendstr(req, "Saved successfully!");
+    vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
     return ESP_OK;
 }
+
 void start_webserver()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -542,6 +557,7 @@ void app_main()
          while(1) {
             vTaskDelay(pdMS_TO_TICKS(1000));
     }
+}
 
     // โหมดปกติ
     xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
